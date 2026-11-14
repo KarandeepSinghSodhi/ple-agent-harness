@@ -1,0 +1,8 @@
+openai>=1.70.0
+websockets>=14.0
+pint>=0.24
+numpy>=1.26
+scipy>=1.13
+sympy>=1.13
+z3-solver>=4.13
+networkx>=3.3
