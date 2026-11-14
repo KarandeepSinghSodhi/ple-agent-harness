@@ -122,6 +122,15 @@ BASE_TOOLS = [
         required=["category"],
     ),
     tool_def(
+        "eng_calc",
+        "Run deterministic engineering calculations: calc_type in {'asce7_combos', 'bearing_terzaghi', 'settlement', 'voltage_drop', 'fire_dstar'}, params dict.",
+        {
+            "calc_type": {"type": "string"},
+            "params": {"type": "object", "additionalProperties": True},
+        },
+        required=["calc_type", "params"],
+    ),
+    tool_def(
         "ledger_update",
         "Update the Living Engineering Ledger with discipline, codes, verified invariants, or deliverable statuses.",
         {
@@ -164,11 +173,48 @@ def marked(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+async def auto_recon(session: taskbridge.Session) -> str:
+    """Runs a deterministic filesystem reconnaissance inside the task container before planning."""
+    py_script = (
+        "import os\n"
+        f"roots = [r for r in ({json.dumps(session.workdir)}, '/filesystem', '/app') if os.path.exists(r)]\n"
+        "seen = set()\n"
+        "lines = []\n"
+        "for root in roots:\n"
+        "  real = os.path.realpath(root)\n"
+        "  if real in seen: continue\n"
+        "  seen.add(real)\n"
+        "  lines.append(f'=== {root} ===')\n"
+        "  count = 0\n"
+        "  for dp, dirs, files in os.walk(root):\n"
+        "    depth = dp[len(root):].count(os.sep)\n"
+        "    if depth > 3:\n"
+        "      dirs[:] = []\n"
+        "      continue\n"
+        "    for f in sorted(files)[:30]:\n"
+        "      fp = os.path.join(dp, f)\n"
+        "      try: sz = os.path.getsize(fp)\n"
+        "      except OSError: sz = -1\n"
+        "      lines.append(f'  {fp} ({sz} B)')\n"
+        "      count += 1\n"
+        "      if count >= 120:\n"
+        "        lines.append('  ... (truncated)')\n"
+        "        break\n"
+        "    if count >= 120: break\n"
+        "print('\\n'.join(lines))\n"
+    )
+    try:
+        res = await session.exec(f"python3 -c {json.dumps(py_script)}", timeout_sec=30)
+        return clip(res["output"])
+    except Exception as exc:
+        return f"(auto_recon unavailable: {exc})"
+
+
 async def audit_paths_in_container(session: taskbridge.Session, paths: list[str]) -> str:
     if not paths:
         return json.dumps({"ok": False, "error": "No deliverable paths provided"})
     py_script = (
-        "import ast, json, os, zipfile\n"
+        "import ast, csv, json, os, zipfile\n"
         f"paths = {json.dumps(paths)}\n"
         "results = {}\n"
         "for p in paths:\n"
@@ -177,20 +223,21 @@ async def audit_paths_in_container(session: taskbridge.Session, paths: list[str]
         "    continue\n"
         "  if os.path.isdir(p):\n"
         "    files = [os.path.join(dp, f) for dp, _, fn in os.walk(p) for f in fn]\n"
-        "    results[p] = {'exists': True, 'type': 'dir', 'file_count': len(files)}\n"
+        "    results[p] = {'exists': True, 'type': 'dir', 'file_count': len(files), 'sample': files[:25]}\n"
         "    continue\n"
         "  size = os.path.getsize(p)\n"
         "  info = {'exists': True, 'type': 'file', 'size_bytes': size}\n"
+        "  low = p.lower()\n"
         "  if size == 0:\n"
         "    info['error'] = 'empty file'\n"
-        "  elif p.endswith('.py'):\n"
+        "  elif low.endswith('.py'):\n"
         "    try:\n"
         "      with open(p, 'r', encoding='utf-8') as f: ast.parse(f.read())\n"
         "      info['ast_valid'] = True\n"
         "    except Exception as e:\n"
         "      info['ast_valid'] = False\n"
         "      info['error'] = str(e)\n"
-        "  elif p.endswith('.zip'):\n"
+        "  elif low.endswith(('.zip', '.xlsx', '.docx')):\n"
         "    try:\n"
         "      with zipfile.ZipFile(p, 'r') as zf:\n"
         "        bad = zf.testzip()\n"
@@ -198,6 +245,32 @@ async def audit_paths_in_container(session: taskbridge.Session, paths: list[str]
         "        info['zip_members'] = zf.namelist()[:50]\n"
         "    except Exception as e:\n"
         "      info['zip_valid'] = False\n"
+        "      info['error'] = str(e)\n"
+        "  elif low.endswith('.json'):\n"
+        "    try:\n"
+        "      with open(p, 'r', encoding='utf-8') as f: json.load(f)\n"
+        "      info['json_valid'] = True\n"
+        "    except Exception as e:\n"
+        "      info['json_valid'] = False\n"
+        "      info['error'] = str(e)\n"
+        "  elif low.endswith('.csv'):\n"
+        "    try:\n"
+        "      with open(p, 'r', encoding='utf-8', errors='replace') as f:\n"
+        "        rows = list(csv.reader(f))\n"
+        "      info['csv_rows'] = len(rows)\n"
+        "    except Exception as e:\n"
+        "      info['error'] = str(e)\n"
+        "  elif low.endswith('.ifc'):\n"
+        "    try:\n"
+        "      with open(p, 'r', encoding='utf-8', errors='replace') as f: head = f.read(2048)\n"
+        "      info['ifc_step_header'] = 'ISO-10303-21' in head\n"
+        "    except Exception as e:\n"
+        "      info['error'] = str(e)\n"
+        "  elif low.endswith('.pdf'):\n"
+        "    try:\n"
+        "      with open(p, 'rb') as f: head = f.read(8)\n"
+        "      info['pdf_header'] = head.startswith(b'%PDF-')\n"
+        "    except Exception as e:\n"
         "      info['error'] = str(e)\n"
         "  results[p] = info\n"
         "print(json.dumps(results, indent=2))\n"
@@ -265,6 +338,8 @@ async def run_tool(
             return json.dumps(eng_db.verify_units(args["expression"], args.get("target_unit")), indent=2)
         if name == "eng_lookup":
             return eng_db.lookup(args["category"], args.get("key", ""))
+        if name == "eng_calc":
+            return eng_db.calculate(args["calc_type"], args.get("params", {}))
         if name == "ledger_update":
             return eng_ledger.update(
                 discipline=args.get("discipline"),
@@ -391,11 +466,12 @@ async def solve(session: taskbridge.Session) -> str:
     mcp_names = ", ".join(s.get("name", "?") for s in session.mcp_servers) or "none"
 
     await session.log(f"starting PE-Ledger-Solver on {MODEL} ({len(mcp_tool_defs)} MCP tools)")
+    recon_map = await auto_recon(session)
 
     # 1. Planner
     plan_msgs = [
         {"role": "system", "content": PLANNER_PROMPT.format(workdir=session.workdir, mcp_names=mcp_names)},
-        {"role": "user", "content": session.instruction},
+        {"role": "user", "content": f"TASK:\n{session.instruction}\n\nINITIAL FILESYSTEM MAP:\n{recon_map}"},
     ]
     plan = await chat_step(session, eng_ledger, mcp_dispatch, plan_msgs, read_only_tools, until=plan_until)
     await session.log("planning complete")
